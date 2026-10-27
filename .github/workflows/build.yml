@@ -1,0 +1,140 @@
+name: Build sing-box Android (trimmed, arm64-v8a)
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: "sing-box core tag"
+        default: "v1.15.0-alpha.13"
+      app_ref:
+        description: "sing-box-for-android tag (normally the same as core)"
+        default: "v1.15.0-alpha.13"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout sing-box core
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box
+          ref: ${{ inputs.core_ref }}
+          path: sing-box
+          fetch-depth: 0
+
+      - name: Checkout official Android shell
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box-for-android
+          ref: ${{ inputs.app_ref }}
+          path: sing-box-for-android
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Read Go and NDK versions required by the shell
+        id: ver
+        run: |
+          GO_VER=$(grep '^GO_VERSION' sing-box-for-android/version.properties | cut -d= -f2 | tr -d "\"' \r")
+          NDK_VER=$(grep -oP 'ndkVersion\s*=\s*"\K[^"]+' sing-box-for-android/app/build.gradle.kts | head -1 || true)
+          NDK_VER=${NDK_VER:-28.0.13004108}
+          echo "go=${GO_VER#go}" >> "$GITHUB_OUTPUT"
+          echo "ndk=${NDK_VER}" >> "$GITHUB_OUTPUT"
+          echo "Go: ${GO_VER}  NDK: ${NDK_VER}"
+          cat sing-box-for-android/version.properties
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.ver.outputs.go }}
+          cache: false
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "ndk;${{ steps.ver.outputs.ndk }}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ steps.ver.outputs.ndk }}" >> "$GITHUB_ENV"
+
+      - name: Trim build tags (keep utls, dhcp, clash_api, conntrack, low_memory)
+        run: |
+          python3 - <<'PY'
+          import re, pathlib
+          drop = [
+              "with_quic", "with_wireguard", "with_acme", "with_tailscale",
+              "with_gvisor", "with_ech", "with_naive_outbound", "with_ccm",
+              "with_ocm", "with_cloudflared", "with_reality_server",
+              "with_grpc", "with_v2ray_api", "with_purego",
+          ]
+          root = pathlib.Path("sing-box")
+          files = [root / "Makefile"] + list((root / "cmd" / "internal").rglob("*.go"))
+          changed = []
+          for f in files:
+              if not f.is_file() or f.name.endswith("_test.go"):
+                  continue
+              s = f.read_text()
+              o = s
+              for t in drop:
+                  s = re.sub(r"(?<![A-Za-z0-9_])" + t + r"(?![A-Za-z0-9_]),?", "", s)
+              if s != o:
+                  f.write_text(s)
+                  changed.append(str(f))
+          print("patched files:", changed)
+          PY
+          echo "---- tags now present in build files ----"
+          grep -rn "with_" sing-box/Makefile sing-box/cmd/internal || true
+          grep -rq "with_utls" sing-box/Makefile sing-box/cmd/internal || echo "::warning::with_utls not found in build files, check the log above"
+
+      - name: Build libbox.aar
+        working-directory: sing-box
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make lib_install
+          make lib_android
+          mkdir -p ../sing-box-for-android/app/libs
+          cp -f ./*.aar ../sing-box-for-android/app/libs/ 2>/dev/null || true
+          ls -lh ../sing-box-for-android/app/libs
+
+      - name: Create signing key
+        working-directory: sing-box-for-android
+        run: |
+          keytool -genkeypair -keystore release.keystore -alias key0 \
+            -keyalg RSA -keysize 2048 -validity 36500 \
+            -storepass 123456 -keypass 123456 -dname "CN=local"
+          cp release.keystore app/release.keystore
+          printf 'KEYSTORE_PASS=123456\nALIAS_NAME=key0\nALIAS_PASS=123456\n' > local.properties
+          echo "LOCAL_PROPERTIES=$(base64 -w0 local.properties)" >> "$GITHUB_ENV"
+          echo "---- signing related lines in app/build.gradle.kts ----"
+          grep -n -i -E "keystore|storeFile|getProps|signingConfig" app/build.gradle.kts | head -40 || true
+
+      - name: Build APK
+        working-directory: sing-box-for-android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleOtherRelease || {
+            echo "::warning::release build failed, falling back to debug build"
+            ./gradlew --no-daemon assembleOtherDebug
+          }
+
+      - name: Collect arm64-v8a APK
+        run: |
+          mkdir -p out
+          find sing-box-for-android/app/build/outputs/apk -name '*arm64-v8a*.apk' -exec cp {} out/ \;
+          ls -lh out
+          test -n "$(ls out)"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-trimmed-arm64-v8a
+          path: out/*.apk
+          retention-days: 14

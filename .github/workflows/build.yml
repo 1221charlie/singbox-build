@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
       - name: Check versions exist
@@ -80,9 +80,27 @@ jobs:
 
       - name: Install Android NDK
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "ndk;${{ steps.ver.outputs.ndk }}"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ steps.ver.outputs.ndk }}" >> "$GITHUB_ENV"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          mkdir -p "$SDK" 2>/dev/null || sudo mkdir -p "$SDK"
+          [ -w "$SDK" ] || sudo chown -R "$(id -u):$(id -g)" "$SDK"
+          SDKM="$(command -v sdkmanager || true)"
+          if [ -z "$SDKM" ]; then
+            SDKM="$(find "$SDK" -type f -name sdkmanager 2>/dev/null | head -1)"
+          fi
+          if [ -z "$SDKM" ]; then
+            echo "sdkmanager not found, downloading Android command line tools"
+            curl -fsSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
+            mkdir -p "$SDK/cmdline-tools/latest"
+            cp -r /tmp/cmdtools/cmdline-tools/. "$SDK/cmdline-tools/latest/"
+            SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "using sdkmanager: $SDKM"
+          yes | "$SDKM" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$SDK" "ndk;${{ steps.ver.outputs.ndk }}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/${{ steps.ver.outputs.ndk }}" >> "$GITHUB_ENV"
 
       - name: Trim build tags (keep utls, dhcp, clash_api, conntrack, low_memory)
         run: |

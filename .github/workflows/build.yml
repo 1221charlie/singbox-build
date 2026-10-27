@@ -4,11 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       core_ref:
-        description: "sing-box core tag"
-        default: "v1.15.0-alpha.12"
+        description: "sing-box core tag. Leave empty to auto-match the Android shell version"
+        required: false
+        default: ""
       app_ref:
-        description: "sing-box-for-android tag (normally the same as core)"
-        default: "v1.15.0-alpha.12"
+        description: "sing-box-for-android tag or branch. Leave empty for its default branch"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -18,41 +20,42 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
-      - name: Check versions exist
-        id: ref
+      - name: Checkout official Android shell
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box-for-android
+          ref: ${{ inputs.app_ref }}
+          path: sing-box-for-android
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Pick the sing-box core that matches the shell
+        id: core
         run: |
+          VN=$(grep '^VERSION_NAME' sing-box-for-android/version.properties | cut -d= -f2 | tr -d "\"' \r")
           CORE=https://github.com/SagerNet/sing-box
-          APP=https://github.com/SagerNet/sing-box-for-android
-          echo "== core tags containing 1.15 =="
-          git ls-remote --tags "$CORE" | grep '1\.15' | grep -v '\^{}' | awk '{print $2}' | tail -8 || true
-          echo "== android shell tags containing 1.15 =="
-          git ls-remote --tags "$APP" | grep '1\.15' | grep -v '\^{}' | awk '{print $2}' | tail -8 || true
-          if ! git ls-remote --exit-code --tags "$CORE" "refs/tags/${{ inputs.core_ref }}" > /dev/null; then
-            echo "::error::core tag ${{ inputs.core_ref }} does not exist, pick one from the list above"
-            exit 1
+          WANT="${{ inputs.core_ref }}"
+          if [ -z "$WANT" ]; then WANT="v$VN"; fi
+          REF=""
+          for c in "$WANT" "v${WANT#v}" "${WANT#v}"; do
+            if git ls-remote --exit-code --tags "$CORE" "refs/tags/$c" > /dev/null 2>&1; then
+              REF="$c"
+              break
+            fi
+          done
+          if [ -z "$REF" ]; then
+            echo "::warning::core tag for $WANT not found, using the core default branch"
           fi
-          if git ls-remote --exit-code --tags "$APP" "refs/tags/${{ inputs.app_ref }}" > /dev/null; then
-            echo "app_ref=${{ inputs.app_ref }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::shell tag ${{ inputs.app_ref }} not found, using the shell default branch"
-            echo "app_ref=" >> "$GITHUB_OUTPUT"
-          fi
+          echo "core_ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "::warning::INFO shell version=$VN, core ref=${REF:-default branch}"
+          echo "shell version: $VN / core ref: ${REF:-default branch}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout sing-box core
         uses: actions/checkout@v4
         with:
           repository: SagerNet/sing-box
-          ref: ${{ inputs.core_ref }}
+          ref: ${{ steps.core.outputs.core_ref }}
           path: sing-box
-          fetch-depth: 0
-
-      - name: Checkout official Android shell
-        uses: actions/checkout@v4
-        with:
-          repository: SagerNet/sing-box-for-android
-          ref: ${{ steps.ref.outputs.app_ref }}
-          path: sing-box-for-android
-          submodules: recursive
           fetch-depth: 0
 
       - name: Read Go and NDK versions required by the shell
@@ -157,11 +160,40 @@ jobs:
       - name: Build APK
         working-directory: sing-box-for-android
         run: |
+          set +e
           chmod +x gradlew
-          ./gradlew --no-daemon assembleOtherRelease || {
-            echo "::warning::release build failed, falling back to debug build"
-            ./gradlew --no-daemon assembleOtherDebug
+          ./gradlew --no-daemon --stacktrace assembleOtherRelease > "$RUNNER_TEMP/release.log" 2>&1
+          RC=$?
+          if [ $RC -eq 0 ]; then exit 0; fi
+          echo "::warning::release build failed, trying debug build"
+          ./gradlew --no-daemon --stacktrace assembleOtherDebug > "$RUNNER_TEMP/debug.log" 2>&1
+          RC=$?
+          if [ $RC -eq 0 ]; then exit 0; fi
+
+          emit() {
+            while IFS= read -r l; do
+              l="${l:0:280}"
+              l="${l//%/%25}"
+              echo "::error::$1 $l"
+            done
           }
+          block() {
+            awk '/What went wrong/{f=1} f{print} /^\* Try/{f=0}' "$1" | head -30
+            grep -E '^e: |error:|Unresolved reference|Could not resolve|No matching variant|Task .* FAILED' "$1" | head -20
+          }
+          {
+            echo '### release build errors'
+            echo '```'
+            block "$RUNNER_TEMP/release.log"
+            echo '```'
+            echo '### debug build errors'
+            echo '```'
+            block "$RUNNER_TEMP/debug.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          block "$RUNNER_TEMP/release.log" | head -3 | emit "[release]"
+          block "$RUNNER_TEMP/debug.log" | head -6 | emit "[debug]"
+          exit 1
 
       - name: Collect arm64-v8a APK
         run: |
